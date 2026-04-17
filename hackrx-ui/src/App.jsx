@@ -6,6 +6,20 @@ import RunHistory from "./components/RunHistory";
 import { ApiError, askByHash, healthCheck, preprocessFromUpload, preprocessFromUrl, runCombined } from "./lib/api";
 
 const HISTORY_KEY = "hackrx_showcase_history";
+const SAMPLE_POLICY_URL =
+  "https://hackrx.blob.core.windows.net/assets/policy.pdf?sv=2023-01-03&st=2025-07-04T09%3A11%3A24Z&se=2027-07-05T09%3A11%3A00Z&sr=b&sp=r&sig=N4a9OU0w0QXO6AOIBiu4bpl7AXvEZogeT%2FjUHNO7HzQ%3D";
+const SAMPLE_QUESTIONS = [
+  "What is the grace period for premium payment under the National Parivar Mediclaim Plus Policy?",
+  "What is the waiting period for pre-existing diseases (PED) to be covered?",
+  "Does this policy cover maternity expenses, and what are the conditions?",
+  "What is the waiting period for cataract surgery?",
+  "Are the medical expenses for an organ donor covered under this policy?",
+  "What is the No Claim Discount (NCD) offered in this policy?",
+  "Is there a benefit for preventive health check-ups?",
+  "How does the policy define a 'Hospital'?",
+  "What is the extent of coverage for AYUSH treatments?",
+  "Are there any sub-limits on room rent and ICU charges for Plan A?",
+];
 
 function timestampNow() {
   return new Date().toLocaleString();
@@ -25,6 +39,7 @@ export default function App() {
   const [inputMode, setInputMode] = useState("url");
   const [pdfUrl, setPdfUrl] = useState("");
   const [selectedFile, setSelectedFile] = useState(null);
+  const [uploadPreviewUrl, setUploadPreviewUrl] = useState("");
   const [questions, setQuestions] = useState(["What does this document contain?"]);
   const [loading, setLoading] = useState(false);
   const [stepText, setStepText] = useState("Idle");
@@ -46,6 +61,17 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 8)));
   }, [history]);
+
+  useEffect(() => {
+    if (!selectedFile) {
+      setUploadPreviewUrl("");
+      return;
+    }
+
+    const objectUrl = URL.createObjectURL(selectedFile);
+    setUploadPreviewUrl(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [selectedFile]);
 
   useEffect(() => {
     async function checkApi() {
@@ -70,6 +96,22 @@ export default function App() {
     return Boolean(selectedFile);
   }, [inputMode, pdfUrl, selectedFile, questions]);
 
+  const activeDocumentUrl = inputMode === "url" ? pdfUrl.trim() : uploadPreviewUrl;
+
+  const currentPayload = useMemo(() => {
+    return {
+      documents: inputMode === "url" ? pdfUrl.trim() : selectedFile?.name || "<uploaded_file>",
+      questions: normalizeQuestions(questions),
+    };
+  }, [inputMode, pdfUrl, selectedFile, questions]);
+
+  const samplePayload = useMemo(() => {
+    return {
+      documents: SAMPLE_POLICY_URL,
+      questions: SAMPLE_QUESTIONS,
+    };
+  }, []);
+
   function clearForm() {
     setError("");
     setResult(null);
@@ -81,6 +123,15 @@ export default function App() {
 
   function addHistoryEntry(entry) {
     setHistory((prev) => [entry, ...prev].slice(0, 8));
+  }
+
+  function loadPolicySample() {
+    setInputMode("url");
+    setSelectedFile(null);
+    setPdfUrl(SAMPLE_POLICY_URL);
+    setQuestions([...SAMPLE_QUESTIONS]);
+    setError("");
+    setStepText("Sample payload loaded");
   }
 
   async function handleSubmit(event) {
@@ -201,6 +252,16 @@ export default function App() {
 
       <main className="layout-grid">
         <form className="stack" onSubmit={handleSubmit}>
+          <section className="card">
+            <div className="section-title-row">
+              <h2>Quick Start Payload</h2>
+              <button type="button" className="primary" onClick={loadPolicySample} disabled={loading}>
+                Load Policy Sample
+              </button>
+            </div>
+            <pre className="json-panel">{JSON.stringify(samplePayload, null, 2)}</pre>
+          </section>
+
           <PdfInput
             inputMode={inputMode}
             setInputMode={setInputMode}
@@ -212,6 +273,14 @@ export default function App() {
           />
 
           <QuestionBuilder questions={questions} setQuestions={setQuestions} disabled={loading} />
+
+          <section className="card">
+            <div className="section-title-row">
+              <h2>Current Payload</h2>
+              <p className="muted">Questions can be added/removed before submit.</p>
+            </div>
+            <pre className="json-panel">{JSON.stringify(currentPayload, null, 2)}</pre>
+          </section>
 
           <section className="card">
             <div className="section-title-row">
@@ -245,6 +314,22 @@ export default function App() {
         </form>
 
         <aside className="stack">
+          <section className="card viewer-card">
+            <div className="section-title-row">
+              <h2>PDF Viewer</h2>
+              {activeDocumentUrl ? (
+                <a className="ghost viewer-link" href={activeDocumentUrl} target="_blank" rel="noreferrer">
+                  Open in New Tab
+                </a>
+              ) : null}
+            </div>
+            {activeDocumentUrl ? (
+              <iframe title="Policy PDF Viewer" src={activeDocumentUrl} className="pdf-frame" />
+            ) : (
+              <p className="muted">Enter a PDF URL or upload a PDF to preview it here.</p>
+            )}
+          </section>
+
           <RunHistory history={history} onReplay={setResult} />
           <section className="card">
             <h2>Quick Demo Script</h2>
