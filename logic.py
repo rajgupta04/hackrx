@@ -65,6 +65,8 @@ os.makedirs(META_DIR, exist_ok=True)
 SQLITE_DB = os.getenv("SQLITE_DB", "/tmp/faiss_status.db")
 DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "90"))
 RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "5"))
+NEIGHBOR_CHUNK_WINDOW = int(os.getenv("NEIGHBOR_CHUNK_WINDOW", "10"))
+MAX_CONTEXT_CHUNKS = int(os.getenv("MAX_CONTEXT_CHUNKS", "40"))
 USE_AI_FALLBACK_DEFAULT = os.getenv("USE_AI_FALLBACK_DEFAULT", "false").lower() == "true"
 
 # instantiate Gemini models via langchain_google_genai adapter
@@ -374,7 +376,7 @@ def preprocess_local_pdf_blocking(local_pdf: str, pdf_hash: str, pdf_source: str
 
     meta_list = []
     for i, c in enumerate(chunks_meta):
-        meta = {"page": c["page"], "text": c["text"]}
+        meta = {"chunk_index": i, "page": c["page"], "text": c["text"]}
         meta_list.append(meta)
 
     save_faiss_index_and_meta(index, meta_list, pdf_hash)
@@ -428,13 +430,34 @@ def retrieve_top_k_for_query(pdf_hash: str, query: str, top_k: int = 5):
     q = np.array(q_emb).astype("float32")
     q = q / (np.linalg.norm(q) + 1e-9)
     D, I = index.search(q.reshape(1, -1), top_k)
-    ids = I[0].tolist()
-    scores = D[0].tolist()
-    results = []
-    for idx, score in zip(ids, scores):
-        if idx < 0 or idx >= len(meta):
+    seed_ids = I[0].tolist()
+    seed_scores = D[0].tolist()
+
+    # Expand each matched chunk with neighboring chunks (above/below window)
+    score_map = {}
+    for seed_idx, seed_score in zip(seed_ids, seed_scores):
+        if seed_idx < 0 or seed_idx >= len(meta):
             continue
-        results.append({"score": float(score), "page": meta[idx].get("page"), "text": meta[idx].get("text")})
+        for neighbor_idx in range(seed_idx - NEIGHBOR_CHUNK_WINDOW, seed_idx + NEIGHBOR_CHUNK_WINDOW + 1):
+            if 0 <= neighbor_idx < len(meta):
+                prev = score_map.get(neighbor_idx, float("-inf"))
+                score_map[neighbor_idx] = max(prev, float(seed_score))
+
+    # Rank by best seed score, then keep deterministic order by chunk index.
+    expanded_ids = sorted(score_map.keys(), key=lambda idx: (-score_map[idx], idx))[:MAX_CONTEXT_CHUNKS]
+
+    results = []
+    for idx in expanded_ids:
+        results.append(
+            {
+                "score": float(score_map[idx]),
+                "chunk_index": idx,
+                "page": meta[idx].get("page"),
+                "text": meta[idx].get("text"),
+            }
+        )
+
+    print(f"[retrieve] seeds={len([x for x in seed_ids if x >= 0])} expanded={len(results)} top_k={top_k} window={NEIGHBOR_CHUNK_WINDOW}")
     return results
 
 
