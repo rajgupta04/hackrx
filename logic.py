@@ -464,6 +464,32 @@ Return ONLY the JSON object.
     return prompt
 
 
+def build_answer_payload(question: str, answer: str, source_quote: str = "N/A", source_page_number: Any = "N/A") -> Dict[str, Any]:
+    return {
+        "question": question,
+        "answer": answer,
+        "source_quote": source_quote,
+        "source_page_number": source_page_number,
+    }
+
+
+def fallback_source_from_context(context_items: List[dict]) -> Dict[str, Any]:
+    if not context_items:
+        return {"source_quote": "N/A", "source_page_number": "N/A"}
+
+    best = context_items[0]
+    raw_text = (best.get("text") or "").strip()
+    if not raw_text:
+        return {"source_quote": "N/A", "source_page_number": best.get("page", "N/A")}
+
+    first_sentence = raw_text.split(". ")[0].strip()
+    source_quote = first_sentence if first_sentence.endswith(".") else f"{first_sentence}."
+    return {
+        "source_quote": source_quote,
+        "source_page_number": best.get("page", "N/A"),
+    }
+
+
 def answer_questions_using_hash(pdf_hash: str, questions: List[str]) -> Dict[str, Any]:
     status = get_pdf_status(pdf_hash)
 
@@ -480,13 +506,27 @@ def answer_questions_using_hash(pdf_hash: str, questions: List[str]) -> Dict[str
         # Try cache first
         cached = get_cached_answer(pdf_hash, q)
         if cached:
+            try:
+                parsed_cached = json.loads(cached)
+                if isinstance(parsed_cached, dict):
+                    cached = json.dumps(parsed_cached)
+            except Exception:
+                cached = json.dumps(build_answer_payload(question=q, answer=str(cached)))
             answers.append(cached)
             continue
 
         # Retrieve top-k chunks
         top = retrieve_top_k_for_query(pdf_hash, q, top_k=RETRIEVAL_TOP_K)
         if not top:
-            answers.append("No context found in document.")
+            no_context_payload = build_answer_payload(
+                question=q,
+                answer="No context found in document.",
+                source_quote="N/A",
+                source_page_number="N/A",
+            )
+            encoded = json.dumps(no_context_payload)
+            cache_answer(pdf_hash, q, encoded)
+            answers.append(encoded)
             continue
 
         # Build prompt and invoke Gemini
@@ -495,14 +535,27 @@ def answer_questions_using_hash(pdf_hash: str, questions: List[str]) -> Dict[str
             r = _invoke_llm(prompt)
             json_text = r.content.strip().replace("```json", "").replace("```", "")
             parsed = json.loads(json_text)
-            answer_text = parsed.get("answer") or parsed.get("Answer") or json_text
+            fallback_source = fallback_source_from_context(top)
+            answer_payload = build_answer_payload(
+                question=q,
+                answer=parsed.get("answer") or parsed.get("Answer") or json_text,
+                source_quote=parsed.get("source_quote") or fallback_source.get("source_quote", "N/A"),
+                source_page_number=parsed.get("source_page_number") or fallback_source.get("source_page_number", "N/A"),
+            )
         except Exception as e:
             print("LLM call error:", e)
-            answer_text = "LLM call failed; see logs."
+            fallback_source = fallback_source_from_context(top)
+            answer_payload = build_answer_payload(
+                question=q,
+                answer="LLM call failed; see logs.",
+                source_quote=fallback_source.get("source_quote", "N/A"),
+                source_page_number=fallback_source.get("source_page_number", "N/A"),
+            )
 
         # Cache result and add to answers list
-        cache_answer(pdf_hash, q, answer_text)
-        answers.append(answer_text)
+        encoded = json.dumps(answer_payload)
+        cache_answer(pdf_hash, q, encoded)
+        answers.append(encoded)
 
     return {"answers": answers}
 
