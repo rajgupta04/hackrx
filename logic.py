@@ -10,6 +10,7 @@ import os
 import hashlib
 import json
 import pickle
+import re
 import requests
 import time
 from typing import List, Dict, Any, Optional
@@ -67,6 +68,7 @@ DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "90"))
 RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "5"))
 NEIGHBOR_CHUNK_WINDOW = int(os.getenv("NEIGHBOR_CHUNK_WINDOW", "10"))
 MAX_CONTEXT_CHUNKS = int(os.getenv("MAX_CONTEXT_CHUNKS", "40"))
+LEXICAL_TOP_K = int(os.getenv("LEXICAL_TOP_K", "10"))
 USE_AI_FALLBACK_DEFAULT = os.getenv("USE_AI_FALLBACK_DEFAULT", "false").lower() == "true"
 
 # instantiate Gemini models via langchain_google_genai adapter
@@ -420,6 +422,18 @@ def retrieve_top_k_for_query(pdf_hash: str, query: str, top_k: int = 5):
     if not index or not meta:
         return []
 
+    def tokenize(text: str) -> List[str]:
+        return [t for t in re.findall(r"[a-zA-Z0-9]+", (text or "").lower()) if len(t) > 2]
+
+    def lexical_overlap_score(query_tokens: set, doc_text: str) -> float:
+        if not query_tokens:
+            return 0.0
+        doc_tokens = set(tokenize(doc_text))
+        if not doc_tokens:
+            return 0.0
+        overlap = len(query_tokens.intersection(doc_tokens))
+        return overlap / max(len(query_tokens), 1)
+
     # embed query
     try:
         q_emb = _embed_query(query)
@@ -444,7 +458,31 @@ def retrieve_top_k_for_query(pdf_hash: str, query: str, top_k: int = 5):
                 score_map[neighbor_idx] = max(prev, float(seed_score))
 
     # Rank by best seed score, then keep deterministic order by chunk index.
-    expanded_ids = sorted(score_map.keys(), key=lambda idx: (-score_map[idx], idx))[:MAX_CONTEXT_CHUNKS]
+    expanded_ids = sorted(score_map.keys(), key=lambda idx: (-score_map[idx], idx))
+
+    # Hybrid augmentation: add high lexical-overlap chunks from anywhere in document.
+    query_tokens = set(tokenize(query))
+    lexical_ranked = []
+    if query_tokens:
+        for idx, item in enumerate(meta):
+            score = lexical_overlap_score(query_tokens, item.get("text") or "")
+            if score > 0:
+                lexical_ranked.append((idx, score))
+        lexical_ranked.sort(key=lambda x: x[1], reverse=True)
+
+    lexical_added = 0
+    for idx, lex_score in lexical_ranked:
+        if idx in score_map:
+            # Slightly boost semantically selected chunk if lexical terms also match.
+            score_map[idx] = max(score_map[idx], 0.55 + (0.45 * lex_score))
+            continue
+        if lexical_added >= LEXICAL_TOP_K:
+            break
+        score_map[idx] = 0.5 + (0.5 * lex_score)
+        expanded_ids.append(idx)
+        lexical_added += 1
+
+    expanded_ids = sorted(set(expanded_ids), key=lambda idx: (-score_map.get(idx, 0.0), idx))[:MAX_CONTEXT_CHUNKS]
 
     results = []
     for idx in expanded_ids:
@@ -457,7 +495,10 @@ def retrieve_top_k_for_query(pdf_hash: str, query: str, top_k: int = 5):
             }
         )
 
-    print(f"[retrieve] seeds={len([x for x in seed_ids if x >= 0])} expanded={len(results)} top_k={top_k} window={NEIGHBOR_CHUNK_WINDOW}")
+    print(
+        f"[retrieve] seeds={len([x for x in seed_ids if x >= 0])} "
+        f"expanded={len(results)} top_k={top_k} window={NEIGHBOR_CHUNK_WINDOW} lexical_added={lexical_added}"
+    )
     return results
 
 
