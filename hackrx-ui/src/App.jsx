@@ -3,7 +3,7 @@ import PdfInput from "./components/PdfInput";
 import QuestionBuilder from "./components/QuestionBuilder";
 import ResultCard from "./components/ResultCard";
 import RunHistory from "./components/RunHistory";
-import { askByHash, healthCheck, preprocessFromUpload, preprocessFromUrl } from "./lib/api";
+import { ApiError, askByHash, healthCheck, preprocessFromUpload, preprocessFromUrl, runCombined } from "./lib/api";
 
 const HISTORY_KEY = "hackrx_showcase_history";
 
@@ -107,8 +107,32 @@ export default function App() {
       let preprocessResult;
       let sourceLabel;
       if (inputMode === "url") {
-        preprocessResult = await preprocessFromUrl(pdfUrl.trim());
         sourceLabel = pdfUrl.trim();
+        try {
+          preprocessResult = await preprocessFromUrl(sourceLabel);
+        } catch (firstError) {
+          // Support older deployed backends that only expose `/hackrx/run`.
+          if (firstError instanceof ApiError && firstError.status === 404) {
+            setStepText("Using legacy run endpoint");
+            const legacyResult = await runCombined(sourceLabel, cleanedQuestions);
+            const snapshot = {
+              id: `${Date.now()}`,
+              title: sourceLabel,
+              timestamp: timestampNow(),
+              inputMode,
+              sourceLabel,
+              questions: cleanedQuestions,
+              answers: legacyResult.answers || [],
+              pdfHash: "legacy-run",
+            };
+
+            setResult(snapshot);
+            addHistoryEntry(snapshot);
+            setStepText("Completed");
+            return;
+          }
+          throw firstError;
+        }
       } else {
         preprocessResult = await preprocessFromUpload(selectedFile);
         sourceLabel = selectedFile.name;

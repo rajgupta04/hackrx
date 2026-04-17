@@ -1,5 +1,13 @@
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
 
+class ApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 function makeUrl(path) {
   return `${API_BASE_URL}${path}`;
 }
@@ -21,7 +29,7 @@ export async function preprocessFromUrl(documents) {
   });
 
   if (!response.ok) {
-    throw new Error(await parseError(response));
+    throw new ApiError(await parseError(response), response.status);
   }
 
   return response.json();
@@ -37,7 +45,7 @@ export async function preprocessFromUpload(file) {
   });
 
   if (!response.ok) {
-    throw new Error(await parseError(response));
+    throw new ApiError(await parseError(response), response.status);
   }
 
   return response.json();
@@ -51,16 +59,30 @@ export async function askByHash(pdfHash, questions) {
   });
 
   if (!response.ok) {
-    throw new Error(await parseError(response));
+    throw new ApiError(await parseError(response), response.status);
+  }
+
+  return response.json();
+}
+
+export async function runCombined(documents, questions) {
+  const response = await fetch(makeUrl("/hackrx/run"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ documents, questions }),
+  });
+
+  if (!response.ok) {
+    throw new ApiError(await parseError(response), response.status);
   }
 
   return response.json();
 }
 
 export async function healthCheck() {
+  // Some deployed APIs don't expose `/`; any HTTP response means the host is reachable.
   const response = await fetch(makeUrl("/"));
-  if (!response.ok) {
-    throw new Error(`Health check failed: ${response.status}`);
-  }
-  return response.json();
+  return { reachable: Boolean(response) };
 }
+
+export { ApiError };
