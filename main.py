@@ -18,6 +18,7 @@ app = FastAPI(title="HackRx PDF Q&A (Gemini)")
 class QueryRequest(BaseModel):
     documents: str
     questions: List[str]
+    use_ai_fallback: Optional[bool] = None
 
 
 class PreprocessRequest(BaseModel):
@@ -28,6 +29,7 @@ class AskRequest(BaseModel):
     questions: List[str]
     pdf_hash: Optional[str] = None
     documents: Optional[str] = None
+    use_ai_fallback: Optional[bool] = None
 
 
 raw_origins = os.getenv("CORS_ORIGINS", "*")
@@ -84,9 +86,17 @@ async def ask_questions(request_data: AskRequest) -> Dict[str, Any]:
             raise HTTPException(status_code=400, detail="questions must not be empty")
 
         if request_data.pdf_hash:
-            result = answer_pdf_questions_by_hash(request_data.pdf_hash, request_data.questions)
+            result = answer_pdf_questions_by_hash(
+                request_data.pdf_hash,
+                request_data.questions,
+                use_ai_fallback=request_data.use_ai_fallback,
+            )
         elif request_data.documents:
-            result = answer_pdf_questions(request_data.documents, request_data.questions)
+            result = answer_pdf_questions(
+                request_data.documents,
+                request_data.questions,
+                use_ai_fallback=request_data.use_ai_fallback,
+            )
         else:
             raise HTTPException(status_code=400, detail="Provide either pdf_hash or documents")
 
@@ -103,7 +113,8 @@ async def run_submission(request_data: QueryRequest) -> Dict[str, Any]:
     try:
         result = process_document_and_questions(
             pdf_url=request_data.documents,
-            questions=request_data.questions
+            questions=request_data.questions,
+            use_ai_fallback=request_data.use_ai_fallback,
         )
         if "error" in result:
             raise HTTPException(status_code=400, detail=result["error"])

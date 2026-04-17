@@ -54,11 +54,11 @@ export async function preprocessFromUpload(file) {
   return response.json();
 }
 
-export async function askByHash(pdfHash, questions) {
+export async function askByHash(pdfHash, questions, useAIFallback = false) {
   const response = await fetch(makeUrl("/hackrx/ask"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ pdf_hash: pdfHash, questions }),
+    body: JSON.stringify({ pdf_hash: pdfHash, questions, use_ai_fallback: useAIFallback }),
   });
 
   if (!response.ok) {
@@ -68,11 +68,11 @@ export async function askByHash(pdfHash, questions) {
   return response.json();
 }
 
-export async function runCombined(documents, questions) {
+export async function runCombined(documents, questions, useAIFallback = false) {
   const response = await fetch(makeUrl("/hackrx/run"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ documents, questions }),
+    body: JSON.stringify({ documents, questions, use_ai_fallback: useAIFallback }),
   });
 
   if (!response.ok) {

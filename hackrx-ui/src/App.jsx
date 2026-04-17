@@ -41,10 +41,15 @@ export default function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [uploadPreviewUrl, setUploadPreviewUrl] = useState("");
   const [questions, setQuestions] = useState(["What does this document contain?"]);
+  const [useAIFallback, setUseAIFallback] = useState(true);
   const [loading, setLoading] = useState(false);
   const [stepText, setStepText] = useState("Idle");
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
+  const [resultsPopupOpen, setResultsPopupOpen] = useState(false);
+  const [tileMode, setTileMode] = useState("full");
+  const [currentTileIndex, setCurrentTileIndex] = useState(0);
+  const [closedTileIndices, setClosedTileIndices] = useState([]);
   const [history, setHistory] = useState(() => {
     try {
       const raw = localStorage.getItem(HISTORY_KEY);
@@ -102,8 +107,9 @@ export default function App() {
     return {
       documents: inputMode === "url" ? pdfUrl.trim() : selectedFile?.name || "<uploaded_file>",
       questions: normalizeQuestions(questions),
+      use_ai_fallback: useAIFallback,
     };
-  }, [inputMode, pdfUrl, selectedFile, questions]);
+  }, [inputMode, pdfUrl, selectedFile, questions, useAIFallback]);
 
   const samplePayload = useMemo(() => {
     return {
@@ -119,10 +125,40 @@ export default function App() {
     setPdfUrl("");
     setSelectedFile(null);
     setStepText("Idle");
+    setResultsPopupOpen(false);
+    setClosedTileIndices([]);
+    setCurrentTileIndex(0);
   }
 
   function addHistoryEntry(entry) {
     setHistory((prev) => [entry, ...prev].slice(0, 8));
+  }
+
+  function openResultPopup(snapshot) {
+    setResult(snapshot);
+    setClosedTileIndices([]);
+    setCurrentTileIndex(0);
+    setTileMode("full");
+    setResultsPopupOpen(true);
+  }
+
+  function closeSingleTile(index) {
+    setClosedTileIndices((prev) => {
+      const next = prev.includes(index) ? prev : [...prev, index];
+      const visible = result?.questions
+        ?.map((_, idx) => idx)
+        .filter((idx) => !next.includes(idx));
+      if (visible && visible.length > 0 && !visible.includes(currentTileIndex)) {
+        setCurrentTileIndex(visible[0]);
+      }
+      return next;
+    });
+  }
+
+  function closeAllTiles() {
+    setResultsPopupOpen(false);
+    setClosedTileIndices([]);
+    setCurrentTileIndex(0);
   }
 
   function loadPolicySample() {
@@ -178,7 +214,7 @@ export default function App() {
           // Support older deployed backends that only expose `/hackrx/run`.
           if (firstError instanceof ApiError && firstError.status === 404) {
             setStepText("Using legacy run endpoint");
-            const legacyResult = await runCombined(sourceLabel, cleanedQuestions);
+            const legacyResult = await runCombined(sourceLabel, cleanedQuestions, useAIFallback);
             const snapshot = {
               id: `${Date.now()}`,
               title: sourceLabel,
@@ -190,7 +226,7 @@ export default function App() {
               pdfHash: "legacy-run",
             };
 
-            setResult(snapshot);
+            openResultPopup(snapshot);
             addHistoryEntry(snapshot);
             setStepText("Completed");
             return;
@@ -207,7 +243,7 @@ export default function App() {
       }
 
       setStepText("Generating grounded answers");
-      const askResult = await askByHash(preprocessResult.pdf_hash, cleanedQuestions);
+      const askResult = await askByHash(preprocessResult.pdf_hash, cleanedQuestions, useAIFallback);
 
       const snapshot = {
         id: `${Date.now()}`,
@@ -220,7 +256,7 @@ export default function App() {
         pdfHash: preprocessResult.pdf_hash,
       };
 
-      setResult(snapshot);
+      openResultPopup(snapshot);
       addHistoryEntry(snapshot);
       setStepText("Completed");
     } catch (apiError) {
@@ -287,6 +323,10 @@ export default function App() {
               <h2>3. Run Pipeline</h2>
               <p className="muted">Status: {stepText}</p>
             </div>
+            <label className="switch-row">
+              <input type="checkbox" checked={useAIFallback} onChange={(event) => setUseAIFallback(event.target.checked)} disabled={loading} />
+              <span>Use AI fallback when grounded search cannot find answer</span>
+            </label>
             <div className="actions">
               <button type="submit" className="primary" disabled={!canSubmit || loading}>
                 {loading ? "Running..." : "Preprocess + Ask"}
@@ -297,20 +337,6 @@ export default function App() {
             </div>
             {error ? <p className="error">{error}</p> : null}
           </section>
-
-          {result ? (
-            <section className="card">
-              <div className="section-title-row">
-                <h2>Results</h2>
-                <p className="muted">Source hash: {result.pdfHash}</p>
-              </div>
-              <div className="stack">
-                {result.questions.map((question, idx) => (
-                  <ResultCard key={`${question}-${idx}`} question={question} answer={result.answers[idx]} index={idx} />
-                ))}
-              </div>
-            </section>
-          ) : null}
         </form>
 
         <aside className="stack">
@@ -330,7 +356,12 @@ export default function App() {
             )}
           </section>
 
-          <RunHistory history={history} onReplay={setResult} />
+          <RunHistory
+            history={history}
+            onReplay={(item) => {
+              openResultPopup(item);
+            }}
+          />
           <section className="card">
             <h2>Quick Demo Script</h2>
             <ol className="demo-list">
@@ -342,6 +373,83 @@ export default function App() {
           </section>
         </aside>
       </main>
+
+      {resultsPopupOpen && result ? (
+        <section className="result-overlay" role="dialog" aria-modal="true" aria-label="Query results popup">
+          <div className="result-modal">
+            <div className="section-title-row">
+              <h2>Results Tiles</h2>
+              <div className="result-top-actions">
+                <div className="mode-toggle" role="tablist" aria-label="tile mode">
+                  <button type="button" className={tileMode === "single" ? "active" : ""} onClick={() => setTileMode("single")}>
+                    Single
+                  </button>
+                  <button type="button" className={tileMode === "full" ? "active" : ""} onClick={() => setTileMode("full")}>
+                    Full
+                  </button>
+                </div>
+                <button type="button" className="ghost" onClick={closeAllTiles}>
+                  X/X Close All
+                </button>
+              </div>
+            </div>
+
+            <p className="muted">Source hash: {result.pdfHash}</p>
+
+            {tileMode === "single" ? (
+              <div className="stack">
+                {result.questions
+                  .map((question, idx) => ({ question, idx }))
+                  .filter((item) => !closedTileIndices.includes(item.idx) && item.idx === currentTileIndex)
+                  .map((item) => (
+                    <ResultCard
+                      key={`${item.question}-${item.idx}`}
+                      question={item.question}
+                      answer={result.answers[item.idx]}
+                      index={item.idx}
+                      onClose={() => closeSingleTile(item.idx)}
+                    />
+                  ))}
+
+                <div className="actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => setCurrentTileIndex((prev) => Math.max(prev - 1, 0))}
+                    disabled={currentTileIndex <= 0}
+                  >
+                    Prev
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => setCurrentTileIndex((prev) => Math.min(prev + 1, result.questions.length - 1))}
+                    disabled={currentTileIndex >= result.questions.length - 1}
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="stack popup-scroll">
+                {result.questions
+                  .map((question, idx) => ({ question, idx }))
+                  .filter((item) => !closedTileIndices.includes(item.idx))
+                  .map((item) => (
+                    <ResultCard
+                      key={`${item.question}-${item.idx}`}
+                      question={item.question}
+                      answer={result.answers[item.idx]}
+                      index={item.idx}
+                      onClose={() => closeSingleTile(item.idx)}
+                      compact
+                    />
+                  ))}
+              </div>
+            )}
+          </div>
+        </section>
+      ) : null}
     </div>
   );
 }

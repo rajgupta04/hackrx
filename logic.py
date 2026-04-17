@@ -65,6 +65,7 @@ os.makedirs(META_DIR, exist_ok=True)
 SQLITE_DB = os.getenv("SQLITE_DB", "/tmp/faiss_status.db")
 DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "90"))
 RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "5"))
+USE_AI_FALLBACK_DEFAULT = os.getenv("USE_AI_FALLBACK_DEFAULT", "false").lower() == "true"
 
 # instantiate Gemini models via langchain_google_genai adapter
 
@@ -464,12 +465,21 @@ Return ONLY the JSON object.
     return prompt
 
 
-def build_answer_payload(question: str, answer: str, source_quote: str = "N/A", source_page_number: Any = "N/A") -> Dict[str, Any]:
+def build_answer_payload(
+    question: str,
+    answer: str,
+    source_quote: str = "N/A",
+    source_page_number: Any = "N/A",
+    ai_used: bool = False,
+    answer_mode: str = "grounded",
+) -> Dict[str, Any]:
     return {
         "question": question,
         "answer": answer,
         "source_quote": source_quote,
         "source_page_number": source_page_number,
+        "ai_used": ai_used,
+        "answer_mode": answer_mode,
     }
 
 
@@ -490,8 +500,39 @@ def fallback_source_from_context(context_items: List[dict]) -> Dict[str, Any]:
     }
 
 
-def answer_questions_using_hash(pdf_hash: str, questions: List[str]) -> Dict[str, Any]:
+def should_trigger_ai_fallback(answer_payload: Dict[str, Any]) -> bool:
+    ans = str(answer_payload.get("answer", "")).strip().lower()
+    return (
+        ans == "information not found in the document"
+        or ans == "no context found in document."
+        or ans == "llm call failed; see logs."
+    )
+
+
+def prompt_for_ai_fallback(question: str, context_items: List[dict]) -> str:
+    ctx_parts = []
+    for i, it in enumerate(context_items[:3]):
+        ctx_parts.append(f"Context {i+1} (page {it.get('page', 'Unknown')}): {it.get('text', '')[:900]}")
+    ctx_text = "\n".join(ctx_parts) if ctx_parts else "No extracted context available."
+    return f"""
+You are an insurance policy assistant. Provide the best possible answer for the user's question.
+If information is incomplete, clearly say assumptions.
+Keep answer concise and practical.
+
+Question:
+{question}
+
+Available context (may be partial):
+{ctx_text}
+
+Return ONLY a JSON object with keys: question, answer, source_quote, source_page_number.
+If no reliable quote is available, set source_quote to "N/A" and source_page_number to "N/A".
+"""
+
+
+def answer_questions_using_hash(pdf_hash: str, questions: List[str], use_ai_fallback: Optional[bool] = None) -> Dict[str, Any]:
     status = get_pdf_status(pdf_hash)
+    fallback_enabled = USE_AI_FALLBACK_DEFAULT if use_ai_fallback is None else bool(use_ai_fallback)
 
     if status != "done":
         return {
@@ -503,33 +544,58 @@ def answer_questions_using_hash(pdf_hash: str, questions: List[str]) -> Dict[str
     answers = []
 
     for q in questions:
-        # Try cache first
         cached = get_cached_answer(pdf_hash, q)
         if cached:
             try:
                 parsed_cached = json.loads(cached)
                 if isinstance(parsed_cached, dict):
-                    cached = json.dumps(parsed_cached)
+                    if fallback_enabled and should_trigger_ai_fallback(parsed_cached) and not parsed_cached.get("ai_used", False):
+                        cached = None
+                    else:
+                        cached = json.dumps(parsed_cached)
+                else:
+                    cached = json.dumps(build_answer_payload(question=q, answer=str(parsed_cached)))
             except Exception:
-                cached = json.dumps(build_answer_payload(question=q, answer=str(cached)))
+                if fallback_enabled and str(cached).strip().lower() == "information not found in the document":
+                    cached = None
+                else:
+                    cached = json.dumps(build_answer_payload(question=q, answer=str(cached)))
+
+        if cached:
             answers.append(cached)
             continue
 
-        # Retrieve top-k chunks
         top = retrieve_top_k_for_query(pdf_hash, q, top_k=RETRIEVAL_TOP_K)
         if not top:
-            no_context_payload = build_answer_payload(
+            answer_payload = build_answer_payload(
                 question=q,
                 answer="No context found in document.",
                 source_quote="N/A",
                 source_page_number="N/A",
+                ai_used=False,
+                answer_mode="grounded",
             )
-            encoded = json.dumps(no_context_payload)
+
+            if fallback_enabled:
+                try:
+                    fallback_resp = _invoke_llm(prompt_for_ai_fallback(q, []))
+                    fallback_parsed = json.loads(fallback_resp.content.strip().replace("```json", "").replace("```", ""))
+                    answer_payload = build_answer_payload(
+                        question=q,
+                        answer=fallback_parsed.get("answer") or answer_payload["answer"],
+                        source_quote=fallback_parsed.get("source_quote") or "N/A",
+                        source_page_number=fallback_parsed.get("source_page_number") or "N/A",
+                        ai_used=True,
+                        answer_mode="ai-fallback",
+                    )
+                except Exception as fallback_error:
+                    print("AI fallback error (no context):", fallback_error)
+
+            encoded = json.dumps(answer_payload)
             cache_answer(pdf_hash, q, encoded)
             answers.append(encoded)
             continue
 
-        # Build prompt and invoke Gemini
         prompt = prompt_for_gemini_with_context(top, q)
         try:
             r = _invoke_llm(prompt)
@@ -541,6 +607,8 @@ def answer_questions_using_hash(pdf_hash: str, questions: List[str]) -> Dict[str
                 answer=parsed.get("answer") or parsed.get("Answer") or json_text,
                 source_quote=parsed.get("source_quote") or fallback_source.get("source_quote", "N/A"),
                 source_page_number=parsed.get("source_page_number") or fallback_source.get("source_page_number", "N/A"),
+                ai_used=False,
+                answer_mode="grounded",
             )
         except Exception as e:
             print("LLM call error:", e)
@@ -550,9 +618,25 @@ def answer_questions_using_hash(pdf_hash: str, questions: List[str]) -> Dict[str
                 answer="LLM call failed; see logs.",
                 source_quote=fallback_source.get("source_quote", "N/A"),
                 source_page_number=fallback_source.get("source_page_number", "N/A"),
+                ai_used=False,
+                answer_mode="grounded",
             )
 
-        # Cache result and add to answers list
+        if fallback_enabled and should_trigger_ai_fallback(answer_payload):
+            try:
+                fallback_resp = _invoke_llm(prompt_for_ai_fallback(q, top))
+                fallback_parsed = json.loads(fallback_resp.content.strip().replace("```json", "").replace("```", ""))
+                answer_payload = build_answer_payload(
+                    question=q,
+                    answer=fallback_parsed.get("answer") or answer_payload["answer"],
+                    source_quote=fallback_parsed.get("source_quote") or answer_payload.get("source_quote", "N/A"),
+                    source_page_number=fallback_parsed.get("source_page_number") or answer_payload.get("source_page_number", "N/A"),
+                    ai_used=True,
+                    answer_mode="ai-fallback",
+                )
+            except Exception as fallback_error:
+                print("AI fallback error:", fallback_error)
+
         encoded = json.dumps(answer_payload)
         cache_answer(pdf_hash, q, encoded)
         answers.append(encoded)
@@ -607,15 +691,16 @@ def preprocess_uploaded_pdf(file_bytes: bytes, source_name: str = "uploaded.pdf"
     return preprocess_pdf_bytes_blocking(file_bytes=file_bytes, source_name=source_name)
 
 
-def answer_pdf_questions(pdf_url: str, questions: List[str]) -> Dict[str, Any]:
+def answer_pdf_questions(pdf_url: str, questions: List[str], use_ai_fallback: Optional[bool] = None) -> Dict[str, Any]:
     """
     Returns either "processing" status or the answers.
     """
-    return answer_questions_using_index(pdf_url, questions)
+    pdf_hash = pdf_hash_for_url(pdf_url)
+    return answer_questions_using_hash(pdf_hash, questions, use_ai_fallback=use_ai_fallback)
 
 
-def answer_pdf_questions_by_hash(pdf_hash: str, questions: List[str]) -> Dict[str, Any]:
-    return answer_questions_using_hash(pdf_hash, questions)
+def answer_pdf_questions_by_hash(pdf_hash: str, questions: List[str], use_ai_fallback: Optional[bool] = None) -> Dict[str, Any]:
+    return answer_questions_using_hash(pdf_hash, questions, use_ai_fallback=use_ai_fallback)
 
 
 # If run as script, quick CLI:
@@ -633,7 +718,7 @@ if __name__ == "__main__":
     else:
         print("Usage examples:\n  python logic.py --preprocess 'https://...' \n  python logic.py --ask 'https://...' --question 'Who wrote it?'")
 
-def process_document_and_questions(pdf_url: str, questions: List[str]) -> Dict[str, Any]:
+def process_document_and_questions(pdf_url: str, questions: List[str], use_ai_fallback: Optional[bool] = None) -> Dict[str, Any]:
     """
     Combined function to preprocess and then answer questions.
     """
@@ -643,4 +728,4 @@ def process_document_and_questions(pdf_url: str, questions: List[str]) -> Dict[s
     if preprocess_result.get("status") == "failed":
         return {"error": f"Preprocessing failed: {preprocess_result.get('reason', 'unknown')}"}
 
-    return answer_pdf_questions(pdf_url, questions)
+    return answer_pdf_questions(pdf_url, questions, use_ai_fallback=use_ai_fallback)
