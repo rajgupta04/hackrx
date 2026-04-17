@@ -11,6 +11,7 @@ numpy
 fastapi
 uvicorn[standard]
 pydantic
+python-multipart
 
 # Optional CLI support (used in logic.py main block)
 argparse

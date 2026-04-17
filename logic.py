@@ -13,7 +13,6 @@ import pickle
 import requests
 import time
 from typing import List, Dict, Any, Optional
-from pathlib import Path
 
 import numpy as np
 import faiss
@@ -21,7 +20,6 @@ import fitz  # pymupdf
 
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_text_splitters import CharacterTextSplitter
 
 import sqlite3
 import threading
@@ -36,8 +34,24 @@ if not GEMINI_API_KEY:
     print("WARNING: GEMINI_API_KEY not set. Set env var GEMINI_API_KEY to use Gemini.")
 
 # Models
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-pro-preview-06-05")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")  # embedding model (must be an embedding-capable model)
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-pro")
+LLM_FALLBACK_MODELS = [
+    "gemini-2.5-pro",
+    "models/gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "models/gemini-2.5-flash",
+]
+EMBED_MODEL = os.getenv("EMBED_MODEL", "models/gemini-embedding-001")
+EMBED_FALLBACK_MODELS = [
+    "models/gemini-embedding-001",
+    "gemini-embedding-001",
+    "models/gemini-embedding-2-preview",
+    "gemini-embedding-2-preview",
+    "models/embedding-001",
+    "embedding-001",
+    "text-embedding-004",
+    "models/text-embedding-004",
+]
 
 # Local persistence directories (customize via env)
 FAISS_DIR = os.getenv("FAISS_DIR", "/tmp/faiss_cache")
@@ -49,10 +63,78 @@ os.makedirs(META_DIR, exist_ok=True)
 
 # sqlite DB for status & optional cache
 SQLITE_DB = os.getenv("SQLITE_DB", "/tmp/faiss_status.db")
+DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "90"))
+RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "5"))
 
 # instantiate Gemini models via langchain_google_genai adapter
-llm = ChatGoogleGenerativeAI(model=LLM_MODEL, google_api_key=GEMINI_API_KEY, temperature=0)
-embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL, google_api_key=GEMINI_API_KEY)
+
+
+def _llm_model_candidates() -> List[str]:
+    ordered = [LLM_MODEL] + LLM_FALLBACK_MODELS
+    seen = set()
+    candidates = []
+    for model in ordered:
+        if model and model not in seen:
+            seen.add(model)
+            candidates.append(model)
+    return candidates
+
+
+def _invoke_llm(prompt: str):
+    last_error = None
+    for model_name in _llm_model_candidates():
+        try:
+            client = ChatGoogleGenerativeAI(model=model_name, google_api_key=GEMINI_API_KEY, temperature=0)
+            response = client.invoke(prompt)
+            if model_name != LLM_MODEL:
+                print(f"[llm] fallback model selected: {model_name}")
+            return response
+        except Exception as e:
+            last_error = e
+            print(f"[llm] model failed ({model_name}): {e}")
+    raise last_error
+
+
+def _embedding_model_candidates() -> List[str]:
+    # Keep configured model first, then try known alternatives for API/version differences.
+    ordered = [EMBED_MODEL] + EMBED_FALLBACK_MODELS
+    seen = set()
+    candidates = []
+    for model in ordered:
+        if model and model not in seen:
+            seen.add(model)
+            candidates.append(model)
+    return candidates
+
+
+def _embed_documents(chunk_texts: List[str]) -> List[List[float]]:
+    last_error = None
+    for model_name in _embedding_model_candidates():
+        try:
+            client = GoogleGenerativeAIEmbeddings(model=model_name, google_api_key=GEMINI_API_KEY)
+            vectors = client.embed_documents(chunk_texts)
+            if model_name != EMBED_MODEL:
+                print(f"[embedding] fallback model selected: {model_name}")
+            return vectors
+        except Exception as e:
+            last_error = e
+            print(f"[embedding] model failed ({model_name}): {e}")
+    raise last_error
+
+
+def _embed_query(query: str) -> List[float]:
+    last_error = None
+    for model_name in _embedding_model_candidates():
+        try:
+            client = GoogleGenerativeAIEmbeddings(model=model_name, google_api_key=GEMINI_API_KEY)
+            vector = client.embed_query(query)
+            if model_name != EMBED_MODEL:
+                print(f"[embedding] fallback model selected: {model_name}")
+            return vector
+        except Exception as e:
+            last_error = e
+            print(f"[embedding] query model failed ({model_name}): {e}")
+    raise last_error
 
 
 # -------------------------
@@ -90,13 +172,13 @@ def init_sqlite():
 init_sqlite()
 
 
-def set_pdf_status(pdf_hash: str, pdf_url: str, status: str):
+def set_pdf_status(pdf_hash: str, pdf_source: str, status: str):
     conn = sqlite3.connect(SQLITE_DB)
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO pdf_status (pdf_hash, pdf_url, status, updated_at) VALUES (?, ?, ?, ?) "
         "ON CONFLICT(pdf_hash) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at, pdf_url = excluded.pdf_url",
-        (pdf_hash, pdf_url, status, time.time()),
+        (pdf_hash, pdf_source, status, time.time()),
     )
     conn.commit()
     cur.close()
@@ -152,6 +234,10 @@ def pdf_hash_for_url(pdf_url: str) -> str:
     return md5_hex(normalized)
 
 
+def pdf_hash_for_bytes(file_bytes: bytes) -> str:
+    return hashlib.md5(file_bytes).hexdigest()
+
+
 def local_pdf_path(pdf_hash: str) -> str:
     return os.path.join(PDF_DIR, f"{pdf_hash}.pdf")
 
@@ -170,7 +256,7 @@ def download_pdf(pdf_url: str, pdf_hash: str) -> Optional[str]:
     if os.path.exists(local_path):
         return local_path
     try:
-        resp = requests.get(pdf_url, timeout=60, stream=True)
+        resp = requests.get(pdf_url, timeout=DOWNLOAD_TIMEOUT_SECONDS, stream=True)
         resp.raise_for_status()
         with open(local_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
@@ -220,7 +306,7 @@ def build_faiss_for_pdf(pdf_hash: str, chunk_texts: List[str]) -> Optional[faiss
     try:
         # compute embeddings via Google embedding model
         print(f"[embedding] computing {len(chunk_texts)} embeddings...")
-        emb_list = embeddings.embed_documents(chunk_texts)  # list of vectors
+        emb_list = _embed_documents(chunk_texts)
         arr = np.array(emb_list).astype("float32")
         # normalize vectors
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
@@ -257,9 +343,44 @@ def load_faiss_index_and_meta(pdf_hash: str):
         return None, None
 
 
+def save_uploaded_pdf(pdf_hash: str, file_bytes: bytes) -> str:
+    local_path = local_pdf_path(pdf_hash)
+    if not os.path.exists(local_path):
+        with open(local_path, "wb") as f:
+            f.write(file_bytes)
+    return local_path
+
+
 # -------------------------
 # Preprocessing pipeline (blocking)
 # -------------------------
+def preprocess_local_pdf_blocking(local_pdf: str, pdf_hash: str, pdf_source: str):
+    set_pdf_status(pdf_hash, pdf_source, "processing")
+    print(f"[preprocess] starting for {pdf_source} (hash={pdf_hash})")
+
+    # extract text chunks
+    chunks_meta = extract_text_chunks_from_pdf(local_pdf)
+    if not chunks_meta:
+        set_pdf_status(pdf_hash, pdf_source, "failed")
+        return {"status": "failed", "reason": "no_text_extracted", "pdf_hash": pdf_hash}
+
+    chunk_texts = [c["text"] for c in chunks_meta]
+
+    index, arr_norm = build_faiss_for_pdf(pdf_hash, chunk_texts)
+    if index is None:
+        set_pdf_status(pdf_hash, pdf_source, "failed")
+        return {"status": "failed", "reason": "embedding_error", "pdf_hash": pdf_hash}
+
+    meta_list = []
+    for i, c in enumerate(chunks_meta):
+        meta = {"page": c["page"], "text": c["text"]}
+        meta_list.append(meta)
+
+    save_faiss_index_and_meta(index, meta_list, pdf_hash)
+    set_pdf_status(pdf_hash, pdf_source, "done")
+    return {"status": "done", "pdf_hash": pdf_hash}
+
+
 def preprocess_pdf_blocking(pdf_url: str):
     """
     Full preprocessing pipeline:
@@ -273,38 +394,19 @@ def preprocess_pdf_blocking(pdf_url: str):
     Call it in a worker or manually via /preprocess.
     """
     pdf_hash = pdf_hash_for_url(pdf_url)
-    set_pdf_status(pdf_hash, pdf_url, "processing")
-    print(f"[preprocess] starting for {pdf_url} (hash={pdf_hash})")
 
     local_pdf = download_pdf(pdf_url, pdf_hash)
     if not local_pdf:
         set_pdf_status(pdf_hash, pdf_url, "failed")
-        return {"status": "failed", "reason": "download_failed"}
+        return {"status": "failed", "reason": "download_failed", "pdf_hash": pdf_hash}
 
-    # extract text chunks
-    chunks_meta = extract_text_chunks_from_pdf(local_pdf)
-    if not chunks_meta:
-        # no text extracted - mark done but with empty index (you may choose to special-case image PDFs)
-        set_pdf_status(pdf_hash, pdf_url, "failed")
-        return {"status": "failed", "reason": "no_text_extracted"}
+    return preprocess_local_pdf_blocking(local_pdf, pdf_hash, pdf_url)
 
-    chunk_texts = [c["text"] for c in chunks_meta]
 
-    index, arr_norm = build_faiss_for_pdf(pdf_hash, chunk_texts)
-    if index is None:
-        set_pdf_status(pdf_hash, pdf_url, "failed")
-        return {"status": "failed", "reason": "embedding_error"}
-
-    # prepare metadata list (text + page)
-    meta_list = []
-    for i, c in enumerate(chunks_meta):
-        meta = {"page": c["page"], "text": c["text"]}
-        meta_list.append(meta)
-
-    # persist
-    save_faiss_index_and_meta(index, meta_list, pdf_hash)
-    set_pdf_status(pdf_hash, pdf_url, "done")
-    return {"status": "done"}
+def preprocess_pdf_bytes_blocking(file_bytes: bytes, source_name: str = "uploaded.pdf"):
+    pdf_hash = pdf_hash_for_bytes(file_bytes)
+    local_pdf = save_uploaded_pdf(pdf_hash, file_bytes)
+    return preprocess_local_pdf_blocking(local_pdf, pdf_hash, f"upload://{source_name}")
 
 
 # -------------------------
@@ -317,10 +419,10 @@ def retrieve_top_k_for_query(pdf_hash: str, query: str, top_k: int = 5):
 
     # embed query
     try:
-        q_emb = embeddings.embed_query(query)
+        q_emb = _embed_query(query)
     except Exception as e:
         print("retrieve_top_k_for_query embed error:", e)
-        q_emb = embeddings.embed_query(query)  # try again, may raise
+        q_emb = _embed_query(query)
 
     q = np.array(q_emb).astype("float32")
     q = q / (np.linalg.norm(q) + 1e-9)
@@ -362,15 +464,14 @@ Return ONLY the JSON object.
     return prompt
 
 
-def answer_questions_using_index(pdf_url: str, questions: List[str]) -> Dict[str, Any]:
-    pdf_hash = pdf_hash_for_url(pdf_url)
+def answer_questions_using_hash(pdf_hash: str, questions: List[str]) -> Dict[str, Any]:
     status = get_pdf_status(pdf_hash)
 
     if status != "done":
         return {
             "processing": True,
             "status": status or "not_started",
-            "message": "Preprocess the PDF first via /preprocess"
+            "message": "Preprocess the PDF first via /hackrx/preprocess"
         }
 
     answers = []
@@ -383,7 +484,7 @@ def answer_questions_using_index(pdf_url: str, questions: List[str]) -> Dict[str
             continue
 
         # Retrieve top-k chunks
-        top = retrieve_top_k_for_query(pdf_hash, q, top_k=5)
+        top = retrieve_top_k_for_query(pdf_hash, q, top_k=RETRIEVAL_TOP_K)
         if not top:
             answers.append("No context found in document.")
             continue
@@ -391,7 +492,7 @@ def answer_questions_using_index(pdf_url: str, questions: List[str]) -> Dict[str
         # Build prompt and invoke Gemini
         prompt = prompt_for_gemini_with_context(top, q)
         try:
-            r = llm.invoke(prompt)
+            r = _invoke_llm(prompt)
             json_text = r.content.strip().replace("```json", "").replace("```", "")
             parsed = json.loads(json_text)
             answer_text = parsed.get("answer") or parsed.get("Answer") or json_text
@@ -404,6 +505,11 @@ def answer_questions_using_index(pdf_url: str, questions: List[str]) -> Dict[str
         answers.append(answer_text)
 
     return {"answers": answers}
+
+
+def answer_questions_using_index(pdf_url: str, questions: List[str]) -> Dict[str, Any]:
+    pdf_hash = pdf_hash_for_url(pdf_url)
+    return answer_questions_using_hash(pdf_hash, questions)
 
 
 # -------------------------
@@ -444,11 +550,19 @@ def preprocess_pdf(pdf_url: str, background: bool = False) -> Dict[str, Any]:
     return preprocess_pdf_blocking(pdf_url)
 
 
+def preprocess_uploaded_pdf(file_bytes: bytes, source_name: str = "uploaded.pdf") -> Dict[str, Any]:
+    return preprocess_pdf_bytes_blocking(file_bytes=file_bytes, source_name=source_name)
+
+
 def answer_pdf_questions(pdf_url: str, questions: List[str]) -> Dict[str, Any]:
     """
     Returns either "processing" status or the answers.
     """
     return answer_questions_using_index(pdf_url, questions)
+
+
+def answer_pdf_questions_by_hash(pdf_hash: str, questions: List[str]) -> Dict[str, Any]:
+    return answer_questions_using_hash(pdf_hash, questions)
 
 
 # If run as script, quick CLI:
