@@ -15,6 +15,10 @@ function normalizeQuestions(questions) {
   return questions.map((question) => question.trim()).filter(Boolean);
 }
 
+function normalizeUrl(raw) {
+  return (raw || "").trim().replace(/\/+$/, "");
+}
+
 export default function App() {
   const [theme, setTheme] = useState("dark");
   const [apiStatus, setApiStatus] = useState("checking");
@@ -93,6 +97,15 @@ export default function App() {
     if (inputMode === "url" && !pdfUrl.trim()) {
       setError("Enter a PDF URL.");
       return;
+    }
+
+    if (inputMode === "url") {
+      const sourceUrl = normalizeUrl(pdfUrl);
+      const apiUrl = normalizeUrl(import.meta.env.VITE_API_BASE_URL || "");
+      if (sourceUrl && apiUrl && sourceUrl === apiUrl) {
+        setError("You entered the backend API URL in the PDF field. Paste a public PDF link (for example, a direct .pdf file URL).");
+        return;
+      }
     }
 
     if (inputMode === "upload" && !selectedFile) {

@@ -14,6 +14,9 @@ function makeUrl(path) {
 
 async function parseError(response) {
   const contentType = response.headers.get("content-type") || "";
+  if (response.status === 404) {
+    return "Endpoint not found on backend (404). Check backend URL and route compatibility.";
+  }
   if (contentType.includes("application/json")) {
     const body = await response.json();
     return body?.detail || body?.message || JSON.stringify(body);
